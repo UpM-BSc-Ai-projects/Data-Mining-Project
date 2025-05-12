@@ -102,51 +102,30 @@ metric_mse = MeanSquaredError().to(device)
 metric_mae = MeanAbsoluteError().to(device)
 
 # Scheduler
-from torch.optim.lr_scheduler import OneCycleLR
-total_steps = len(train_loader) * num_epochs
-scheduler = OneCycleLR(optimizer, max_lr=1e-4, total_steps=total_steps)
-max_grad_norm = 5.0
+# from torch.optim.lr_scheduler import OneCycleLR
+# total_steps = len(train_loader) * num_epochs
+# scheduler = OneCycleLR(optimizer, max_lr=1e-4, total_steps=total_steps)
+# max_grad_norm = 5.0
 
 # Training loop
 for epoch in range(num_epochs):
     model.train()
     train_losses = []
     for series, target, mask in train_loader:
-        series = series.to(device)     # (batch, channels, L)
+        series = series.to(device)     # (batch, L, C)
         target = target.to(device)     # (batch, H)
         mask   = mask.to(device)       # (batch, L)
 
         optimizer.zero_grad()
-        output = model(x_enc=series, input_mask=mask)  # forward pass
-        
-        # Debug the output shape
-        print(f"Output type: {type(output)}")
-        if hasattr(output, 'forecast'):
-            print(f"Output forecast shape: {output.forecast.shape}")
-            # Check if we need to select a specific channel/feature
-            if len(output.forecast.shape) == 3:  # [batch, channels, horizon]
-                # Select the channel corresponding to 'Close' price (should be channel index 3)
-                forecast = output.forecast[:, features.index(target), :]
-                print(f"Selected forecast shape: {forecast.shape}")
-                loss = mse_loss_fn(forecast, target)
-            else:
-                loss = mse_loss_fn(output.forecast, target)
-        else:
-            # If output is the forecast tensor directly
-            print(f"Direct output shape: {output.shape}")
-            if len(output.shape) == 3:  # [batch, channels, horizon]
-                # Select the channel corresponding to 'Close' price
-                forecast = output[:, features.index(target), :]
-                print(f"Selected forecast shape: {forecast.shape}")
-                loss = mse_loss_fn(forecast, target)
-            else:
-                loss = mse_loss_fn(output, target)
-                
+        output = model(x_enc=series, input_mask=mask)  # forward pass # shape [B, 360] from forecasting head
+        # print(output.forecast.shape, target.shape)
+        # loss = mse_loss_fn(output.forecast, target)
+        loss = mse_loss_fn(output.forecast[:, 3, :], target)
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
-        scheduler.step()
+        # scheduler.step()
         
         train_losses.append(loss.item())
     avg_train_loss = np.mean(train_losses)
@@ -156,63 +135,43 @@ for epoch in range(num_epochs):
     metric_mse.reset(); metric_mae.reset()
     with torch.no_grad():
         for series, target, mask in val_loader:
-            series = series.to(device)
-            target = target.to(device)
-            mask   = mask.to(device)
+            series = series.to(device)     # (batch, L, C)
+            target = target.to(device)     # (batch, H)
+            mask   = mask.to(device)       # (batch, L)
 
             output = model(x_enc=series, input_mask=mask)
-            
-            # Handle output shape like in training
-            if hasattr(output, 'forecast'):
-                if len(output.forecast.shape) == 3:  # [batch, channels, horizon]
-                    forecast = output.forecast[:, features.index(target), :]
-                else:
-                    forecast = output.forecast
-            else:
-                if len(output.shape) == 3:  # [batch, channels, horizon]
-                    forecast = output[:, features.index(target), :]
-                else:
-                    forecast = output
-                    
-            val_loss = mse_loss_fn(forecast, target)
+            val_loss = huber_loss_fn(output.forecast[:, 3, :], target)
             val_losses.append(val_loss.item())
-            metric_mse(forecast, target)
-            metric_mae(forecast, target)
-            
+            preds = output.forecast[:, 3, :].contiguous()
+            metric_mse(preds, target)
+            metric_mae(preds, target)
     avg_val_loss = np.mean(val_losses)
     val_mse = metric_mse.compute().item()
     val_mae = metric_mae.compute().item()
 
-    print(f"Epoch {epoch+1} | Train MSE {avg_train_loss:.4f} | Val MSE {val_mse:.4f}, Val MAE {val_mae:.4f}")
+    print(f"Epoch {epoch+1} | Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f}  | Val MSE {val_mse:.4f}, Val MAE {val_mae:.4f}")
+
 
 # Testing
 model.eval()
 test_losses = []
 metric_mse.reset(); metric_mae.reset()
+predicted_values = []
+target_values = []
 with torch.no_grad():
-    for series, target, mask in DataLoader(test_ds, batch_size=16):
-        series = series.to(device)
-        target = target.to(device)
-        mask   = mask.to(device)
-        
+    for series, target, mask in test_loader:
+        series, target, mask = series.to(device), target.to(device), mask.to(device)
         output = model(x_enc=series, input_mask=mask)
+
+        preds = output.forecast[:, 3, :].contiguous()
+        metric_mse(preds, target)
+        metric_mae(preds, target)
         
-        # Handle output shape like in training
-        if hasattr(output, 'forecast'):
-            if len(output.forecast.shape) == 3:  # [batch, channels, horizon]
-                forecast = output.forecast[:, features.index(target), :]
-            else:
-                forecast = output.forecast
-        else:
-            if len(output.shape) == 3:  # [batch, channels, horizon]
-                forecast = output[:, features.index(target), :]
-            else:
-                forecast = output
-                
-        metric_mse(forecast, target)
-        metric_mae(forecast, target)
-        test_losses.append(huber_loss_fn(forecast, target).item())
+        predicted_values = preds[-1].cpu()
+        target_values = target[-1].cpu()
         
+        # For reporting Huber:
+        test_losses.append(huber_loss_fn(output.forecast[:, 3, :], target).item())
 test_mse = metric_mse.compute().item()
 test_mae = metric_mae.compute().item()
 test_huber = np.mean(test_losses)
